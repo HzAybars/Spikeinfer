@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Quoted: unquoted 3.10 is the float 3.1 in YAML.
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU-only torch
+        # Runners have no GPU; the default wheel would pull ~2.5 GB of CUDA.
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install spikeinfer
+        run: pip install -e ".[dev,reference]"
+
+      - name: Lint
+        if: matrix.python-version == '3.12'
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: Test
+        # 128 tests run on CPU. The rest need CUDA and skip themselves here --
+        # the paged attention kernel, CUDA graph capture and every end-to-end
+        # engine test have to be run on a GPU machine before merging.
+        run: pytest tests -q

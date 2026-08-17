@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spikeinfer"
+version = "0.2.0"
+description = "Inference engine and OpenAI-compatible server for spiking (LIF) transformers: bit-packed spike KV cache, popcount attention, continuous batching, CUDA graphs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["spiking-neural-networks", "snn", "llm", "inference", "triton", "lif", "qwen"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.5",          # enable_gqa in scaled_dot_product_attention
+    "transformers>=4.40",  # Qwen2 building blocks + tokenizers
+    "safetensors>=0.4",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "pydantic>=2.5"]
+dev = ["pytest>=7", "httpx>=0.27", "fastapi>=0.110", "uvicorn>=0.27", "pydantic>=2.5"]
+reference = ["snntorch>=0.9"]  # golden reference + the test suite only
+
+# Triton is intentionally NOT a hard dependency:
+#   * on Linux it ships inside the torch wheel
+#   * on Windows it is a separate package (`triton-windows`)
+#   * without it, lif_multistep() and the paged spike attention fall back to
+#     pure-PyTorch implementations, so the package still imports and runs
+[project.urls]
+Homepage = "https://github.com/HzAybars/Spikeinfer"
+Issues = "https://github.com/HzAybars/Spikeinfer/issues"
+
+[project.scripts]
+spikeinfer = "spikeinfer.entrypoints.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["spikeinfer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device",
+    "slow: takes more than a few seconds",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# E501: line length is enforced by the formatter, not the linter.
+# B008: FastAPI's dependency injection relies on calls in argument defaults.
+# B905: zip(strict=) is 3.10+, and the zips here are length-checked by construction.
+ignore = ["E501", "B008", "B905"]
+
+[tool.ruff.lint.isort]
+# tests/ import their fixtures from a bare `conftest`, which is first-party.
+known-first-party = ["spikeinfer", "conftest"]

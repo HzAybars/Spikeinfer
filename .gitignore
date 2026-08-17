@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# model weights and datasets -- never commit these
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+checkpoints/
+hf_cache/
+data/
+models/
+
+# benchmark and profiling artifacts
+*.json.trace
+bench_results*.json
+logs/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# editors and OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
