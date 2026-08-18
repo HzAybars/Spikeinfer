@@ -189,12 +189,17 @@ def paged_spike_attn_decode(
         out = torch.empty((T, n_seqs, n_heads, head_dim), device=q_packed.device, dtype=dtype)
 
     if not _HAS_TRITON or not q_packed.is_cuda:
-        ref = paged_spike_attn_decode_ref(
+        # Pure-torch path: CPU installs, and CUDA installs without Triton. Not
+        # `_ref` -- see spike_attention_cpu for why the packed popcount is the
+        # wrong trade without a GPU's memory hierarchy. `_ref` stays below as
+        # the oracle both of these are checked against.
+        from .spike_attention_cpu import paged_spike_attn_decode_cpu
+
+        return paged_spike_attn_decode_cpu(
             q_packed, k_cache, v_cache, block_tables, seq_lens,
-            head_dim, block_size, num_q_heads, num_kv_heads, dtype=out.dtype,
+            head_dim, block_size, num_q_heads, num_kv_heads,
+            out=out, dtype=out.dtype,
         )
-        out.copy_(ref)
-        return out
 
     grid = (n_seqs, num_q_heads, T)
     _paged_spike_attn_decode_kernel[grid](

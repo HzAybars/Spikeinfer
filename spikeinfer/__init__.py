@@ -34,7 +34,7 @@ engine is validated against. Parameter names match exactly, so
 
 Inference only -- no backward pass. Fine-tuning stays on the reference path.
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .attention import AttentionMetadata, paged_attention
 from .config import CacheConfig, EngineConfig, GraphConfig, ModelConfig, SchedulerConfig

@@ -25,6 +25,8 @@ from spikeinfer.loader import (
     save_model,
 )
 
+TEST_DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
+
 
 @pytest.fixture
 def saved_model(tmp_path):
@@ -62,36 +64,32 @@ def test_config_omits_transformers_version(saved_model):
     assert "transformers_version" not in raw
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_weights_round_trip_exactly(saved_model):
     path, original, _ = saved_model
-    loaded, _ = load_model(path, dtype=torch.float32, device="cuda")
+    loaded, _ = load_model(path, dtype=torch.float32, device=TEST_DEVICE)
 
     original_state = original.state_dict()
     for name, tensor in loaded.state_dict().items():
         assert torch.equal(tensor.cpu(), original_state[name].cpu()), f"{name} changed"
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_tied_embeddings_stay_shared(saved_model):
     """lm_head is not stored; loading must re-tie it, not leave it random."""
     path, _, cfg = saved_model
     assert cfg.tie_word_embeddings
-    loaded, _ = load_model(path, dtype=torch.float32, device="cuda")
+    loaded, _ = load_model(path, dtype=torch.float32, device=TEST_DEVICE)
     assert loaded.lm_head.weight.data_ptr() == loaded.model.embed_tokens.weight.data_ptr()
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_dtype_is_applied_on_load(saved_model):
     path, _, _ = saved_model
-    loaded, _ = load_model(path, dtype=torch.bfloat16, device="cuda")
+    loaded, _ = load_model(path, dtype=torch.bfloat16, device=TEST_DEVICE)
     assert loaded.model.embed_tokens.weight.dtype == torch.bfloat16
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_timesteps_can_be_overridden_at_load(saved_model):
     path, _, _ = saved_model
-    _, cfg = load_model(path, dtype=torch.float32, device="cuda", timesteps=2)
+    _, cfg = load_model(path, dtype=torch.float32, device=TEST_DEVICE, timesteps=2)
     assert cfg.T == 2
 
 
@@ -102,7 +100,6 @@ def test_loading_a_file_explains_how_to_convert(tmp_path):
         load_model(checkpoint)
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_a_missing_tensor_is_an_error_not_a_random_weight(saved_model, tmp_path):
     from safetensors.torch import load_file, save_file
 
@@ -116,10 +113,9 @@ def test_a_missing_tensor_is_an_error_not_a_random_weight(saved_model, tmp_path)
     save_file(state, str(broken / WEIGHTS_NAME), metadata={"format": "pt"})
 
     with pytest.raises(RuntimeError, match="missing"):
-        load_model(broken, dtype=torch.float32, device="cuda")
+        load_model(broken, dtype=torch.float32, device=TEST_DEVICE)
 
 
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 def test_an_unknown_tensor_is_an_error(saved_model, tmp_path):
     from safetensors.torch import load_file, save_file
 
@@ -133,7 +129,7 @@ def test_an_unknown_tensor_is_an_error(saved_model, tmp_path):
     save_file(state, str(broken / WEIGHTS_NAME), metadata={"format": "pt"})
 
     with pytest.raises(RuntimeError, match="unknown"):
-        load_model(broken, dtype=torch.float32, device="cuda")
+        load_model(broken, dtype=torch.float32, device=TEST_DEVICE)
 
 
 def test_copy_tokenizer_skips_absent_files(tmp_path):

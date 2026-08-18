@@ -12,9 +12,9 @@ import json
 import pytest
 import torch
 
-from conftest import CUDA_AVAILABLE, small_config
+from conftest import CUDA_AVAILABLE, build_fast_model, small_config
 
-pytestmark = pytest.mark.skipif(not CUDA_AVAILABLE, reason="server tests need CUDA")
+TEST_DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
@@ -46,7 +46,6 @@ class CharTokenizer:
 
 @pytest.fixture(scope="module")
 def client(tmp_path_factory):
-    from conftest import build_fast_model
     from spikeinfer.config import (
         CacheConfig,
         EngineConfig,
@@ -68,14 +67,15 @@ def client(tmp_path_factory):
         cache=CacheConfig(block_size=16, num_gpu_blocks_override=64),
         scheduler=SchedulerConfig(max_num_seqs=4, max_num_batched_tokens=128, max_model_len=64),
         graph=GraphConfig(enabled=False),
-        device="cuda",
+        device=TEST_DEVICE,
     )
     engine = AsyncLLMEngine(LLMEngine(config, tokenizer=CharTokenizer()))
     app = build_app(engine, served_model_name="test-model")
     with TestClient(app) as test_client:
         yield test_client
     del engine
-    torch.cuda.empty_cache()
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
 
 
 def sse_events(text: str) -> list[dict]:
@@ -285,7 +285,6 @@ def test_prompt_over_the_model_limit_is_a_client_error(client):
 
 
 def test_api_key_is_enforced_when_set(tmp_path_factory):
-    from conftest import build_fast_model
     from spikeinfer.config import (
         CacheConfig,
         EngineConfig,
@@ -309,7 +308,7 @@ def test_api_key_is_enforced_when_set(tmp_path_factory):
                 scheduler=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=64,
                                           max_model_len=64),
                 graph=GraphConfig(enabled=False),
-                device="cuda",
+                device=TEST_DEVICE,
             ),
             tokenizer=CharTokenizer(),
         )
@@ -324,4 +323,5 @@ def test_api_key_is_enforced_when_set(tmp_path_factory):
         )
         assert ok.status_code == 200
     del engine
-    torch.cuda.empty_cache()
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()

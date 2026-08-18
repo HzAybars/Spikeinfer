@@ -61,13 +61,17 @@ class LLMEngine:
         self.config = config
         self.device = torch.device(config.device)
         self.dtype = config.torch_dtype
+        if config.devices.cpu_threads is not None:
+            torch.set_num_threads(config.devices.cpu_threads)
 
         self.tokenizer = tokenizer if tokenizer is not None else _load_tokenizer(config.model)
+        self.plan = _build_plan(config, self.device, self.dtype)
         self.model, self.model_config = load_model(
             config.model.model,
             dtype=self.dtype,
             device=self.device,
             timesteps=config.model.timesteps,
+            plan=self.plan,
         )
         self.timesteps = self.model_config.T
         self.head_dim = getattr(
@@ -90,6 +94,7 @@ class LLMEngine:
             num_blocks=num_blocks,
             block_size=config.cache.block_size,
             device=self.device,
+            layer_devices=_cache_devices(self.plan, self.device),
         )
         self.block_manager = BlockManager(
             self.cache.num_allocatable_blocks, config.cache.block_size
@@ -106,6 +111,9 @@ class LLMEngine:
         self._requests: dict[str, _Request] = {}
         self._seq_counter = 0
 
+        self._graph_note = _graph_note(self.plan, config)
+        if self._graph_note:
+            config.graph.enabled = False
         self.captured_graphs = self.runner.capture_graphs()
 
     # -- construction helpers --------------------------------------------
@@ -155,7 +163,7 @@ class LLMEngine:
         if override is not None:
             return override
         if self.device.type != "cuda":
-            return max(2, self.config.scheduler.max_model_len // self.config.cache.block_size + 2)
+            return self._size_host_cache()
 
         block_size = self.config.cache.block_size
         per_block = PagedSpikeCache.bytes_per_block(
@@ -180,6 +188,10 @@ class LLMEngine:
             num_blocks=probe_blocks,
             block_size=block_size,
             device=self.device,
+            # The probe runs a real forward through the real placement, so its
+            # cache has to be laid out like the real one -- a CPU layer handed
+            # an all-CUDA probe cache fails on the first index_copy_.
+            layer_devices=_cache_devices(self.plan, self.device),
         )
         self._dummy_prefill(probe, probe_tokens)
         torch.cuda.synchronize()
@@ -196,19 +208,7 @@ class LLMEngine:
 
         num_blocks = int(available // per_block)
 
-        # A packed spike cache is so cheap that the memory budget alone would
-        # reserve millions of tokens the scheduler can never fill: it will not
-        # run more than max_num_seqs sequences, none longer than max_model_len.
-        # Reserving beyond that is pure startup cost, so cap it there.
-        ceiling = (
-            math.ceil(
-                self.config.scheduler.max_num_seqs
-                * self.config.scheduler.max_model_len
-                / block_size
-            )
-            + 1
-        )
-        num_blocks = min(num_blocks, ceiling)
+        num_blocks = min(num_blocks, self._block_ceiling(block_size))
 
         if num_blocks < 2:
             raise RuntimeError(
@@ -216,6 +216,59 @@ class LLMEngine:
                 f"(need > {2 * per_block / 2**20:.1f} MiB, have "
                 f"{available / 2**20:.1f} MiB). Lower --max-num-batched-tokens or "
                 "raise --gpu-memory-utilization."
+            )
+        return num_blocks
+
+    def _block_ceiling(self, block_size: int) -> int:
+        """Blocks beyond which the scheduler can never fill the cache.
+
+        A packed spike cache is cheap enough that a pure memory budget would
+        reserve millions of tokens: the scheduler will not run more than
+        ``max_num_seqs`` sequences, none longer than ``max_model_len``.
+        Reserving past that is startup cost and nothing else.
+        """
+        return (
+            math.ceil(
+                self.config.scheduler.max_num_seqs
+                * self.config.scheduler.max_model_len
+                / block_size
+            )
+            + 1
+        )
+
+    def _size_host_cache(self) -> int:
+        """Blocks for a CPU-resident cache, sized against host RAM.
+
+        There is no equivalent of the CUDA probe here: host allocations are not
+        reserved up front and ``max_memory_allocated`` has no host counterpart,
+        so the working set cannot be measured the same way. Instead a fraction
+        of *available* RAM is taken (available, not total -- the weights are
+        already resident by this point and must not be counted twice).
+        """
+        from ..sysinfo import available_ram_bytes, format_bytes
+
+        devices = self.config.devices
+        block_size = self.config.cache.block_size
+        per_block = PagedSpikeCache.bytes_per_block(
+            self.model_config.num_hidden_layers,
+            self.timesteps,
+            self.model_config.num_key_value_heads,
+            self.head_dim,
+            block_size,
+        )
+
+        if devices.cpu_kv_gb is not None:
+            budget = devices.cpu_kv_gb * 2**30
+        else:
+            budget = available_ram_bytes() * devices.cpu_memory_utilization
+
+        num_blocks = min(int(budget // per_block), self._block_ceiling(block_size))
+        if num_blocks < 2:
+            raise RuntimeError(
+                "not enough host memory for a KV cache "
+                f"(need > {format_bytes(2 * per_block)}, budget is "
+                f"{format_bytes(budget)}). Raise --cpu-kv-gb or "
+                "--cpu-memory-utilization, or lower --max-model-len."
             )
         return num_blocks
 
@@ -411,7 +464,130 @@ class LLMEngine:
             "kv_capacity_tokens": self.cache.capacity_tokens,
             "captured_graph_batch_sizes": self.captured_graphs,
             "device": str(self.device),
+            "kv_cache_device": self.cache.device_summary,
+            "cuda_graphs": self._graph_status(),
+            "placement": self.plan.summary() if self.plan is not None else None,
         }
+
+    def _graph_status(self) -> str:
+        """Why decode is or is not replaying a captured graph.
+
+        Worth reporting rather than inferring: an empty
+        ``captured_graph_batch_sizes`` looks the same whether the user disabled
+        capture, is on a CPU, or capture failed and fell back.
+        """
+        if self.captured_graphs:
+            return "enabled"
+        if self._graph_note:
+            return self._graph_note
+        if not self.config.graph.enabled:
+            return "disabled (--no-cuda-graph)"
+        if self.device.type != "cuda":
+            return f"unavailable (device={self.device.type})"
+        return "not captured"  # pragma: no cover - capture either works or raises
+
+
+
+def _build_plan(config: EngineConfig, device: torch.device, dtype: torch.dtype):
+    """The plan for this engine, or ``None`` when nothing was asked for.
+
+    Returning ``None`` rather than a trivial plan matters: it is what keeps the
+    ordinary single-device path free of the executor, the ring and the
+    per-device metadata mirrors entirely.
+    """
+    from ..loader import load_config
+    from ..placement import plan_from_config
+
+    devices = config.devices
+    if (
+        devices.gpu_layers is None
+        and devices.offload_layers is None
+        and not devices.offload_embeddings
+        and not devices.adaptive_mlp
+    ):
+        return None
+
+    model_config = load_config(config.model.model)
+    if config.model.timesteps is not None:
+        model_config.T = config.model.timesteps
+
+    free_vram = 0
+    if device.type == "cuda":
+        free_vram = int(torch.cuda.mem_get_info()[0] * config.cache.gpu_memory_utilization)
+
+    spike_stats = None
+    if devices.adaptive_mlp:
+        from pathlib import Path
+
+        from .. import spike_stats as spike_stats_mod
+
+        candidate = Path(config.model.model) / "spike_stats.json"
+        if candidate.exists():
+            spike_stats = spike_stats_mod.load(candidate)
+        else:
+            warnings.warn(
+                f"--adaptive-mlp with no {candidate}: the hot/cold split will use a "
+                "flat 20% of channels per layer instead of measured firing rates. "
+                "Run `spikeinfer spike-stats <model> --write` for a fitted split.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    plan = plan_from_config(
+        model_config, devices, dtype, free_vram, spike_stats=spike_stats
+    )
+    if devices.adaptive_mlp and device.type == "cuda":
+        warnings.warn(
+            "--adaptive-mlp on CUDA trades CUDA graph capture for a per-layer "
+            "host round trip. Measured on this project's reference setup it is "
+            "slower than --offload-layers at more VRAM (28.1 vs 34.9 tok/s, "
+            "833 vs 389 MiB), because the round trip costs far more than the "
+            "transfer it avoids. It pays on CPU (+30%), on slow links, and on "
+            "platforms with cheap synchronisation. See spikeinfer/offload.py.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return None if plan.is_trivial else plan
+
+
+def _cache_devices(plan, device: torch.device):
+    """Where each layer's KV slabs go. ``None`` means all on ``device``."""
+    if plan is None:
+        return None
+    from ..placement import Placement
+
+    return [torch.device("cpu") if p is Placement.CPU else device for p in plan.layers]
+
+
+def _graph_note(plan, config: EngineConfig) -> str | None:
+    """Why capture is off under this plan, or ``None`` if it can stay on.
+
+    Capture bakes in a fixed sequence of kernel launches. A hybrid split leaves
+    that stream mid-way to run on the CPU, and the adaptive MLP path decides how
+    many channels to fetch from a device-to-host read of the gate mask -- neither
+    is capturable at all.
+
+    Dense weight streaming *is* capturable: a copy from pinned host memory is a
+    legal graph node, the host pointers are stable for the process's life, and
+    the per-layer sequence is identical every step. It needs the copy stream
+    forked and joined inside the capture region, which
+    ``StreamingLayerRing.begin_pass`` arranges. Capture is attempted and falls
+    back to eager if the driver disagrees -- see ``ModelRunner.capture_graphs``.
+    """
+    if plan is None or not config.graph.enabled:
+        return None
+    from ..placement import Placement
+
+    if any(p is Placement.CPU for p in plan.layers):
+        return "unavailable (hybrid cpu/gpu split cannot be captured as one graph)"
+    if any(p is Placement.ADAPTIVE for p in plan.layers):
+        return "unavailable (--adaptive-mlp reads the gate mask on the host each layer)"
+    if Placement.CPU in (plan.embeddings, plan.head):
+        # The embedding lookup would run on the CPU inside the captured region.
+        # Capture does not merely skip it -- it poisons the stream, and the
+        # failure surfaces later as an unrelated CUDA error, so refuse up front.
+        return "unavailable (--offload-embeddings puts the embedding lookup on the host)"
+    return None
 
 
 def _load_tokenizer(model_config: ModelConfig):

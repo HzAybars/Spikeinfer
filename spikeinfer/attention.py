@@ -52,9 +52,47 @@ class AttentionMetadata:
     prefill_context_lens: list[int] = field(default_factory=list)
     prefill_block_tables: list[torch.Tensor] = field(default_factory=list)
 
+    _mirrors: dict = field(default_factory=dict, repr=False, compare=False)
+    """Per-device copies, built on demand. See :meth:`on`."""
+
     @property
     def num_prefills(self) -> int:
         return len(self.prefill_query_lens)
+
+    def on(self, device: torch.device) -> AttentionMetadata:
+        """This metadata, with its tensors on ``device``.
+
+        A hybrid placement runs some layers on the GPU and some on the CPU, and
+        each layer's cache slabs live where it computes -- so ``index_copy_``
+        and the decode kernel need indices on the matching device. Copies are
+        memoised per step because the metadata is rebuilt every step anyway;
+        the cache lives on the object and dies with it.
+
+        Returns ``self`` when the device already matches, which is every call in
+        the ordinary single-device case, so this costs a comparison there.
+        """
+        if self.slot_mapping.device == device:
+            return self
+        key = str(device)
+        mirror = self._mirrors.get(key)
+        if mirror is None:
+            mirror = AttentionMetadata(
+                slot_mapping=self.slot_mapping.to(device, non_blocking=True),
+                block_size=self.block_size,
+                num_decode_tokens=self.num_decode_tokens,
+                block_tables=None
+                if self.block_tables is None
+                else self.block_tables.to(device, non_blocking=True),
+                seq_lens=None
+                if self.seq_lens is None
+                else self.seq_lens.to(device, non_blocking=True),
+                prefill_query_starts=self.prefill_query_starts,
+                prefill_query_lens=self.prefill_query_lens,
+                prefill_context_lens=self.prefill_context_lens,
+                prefill_block_tables=[t.to(device, non_blocking=True) for t in self.prefill_block_tables],
+            )
+            self._mirrors[key] = mirror
+        return mirror
 
 
 def _causal_offset_mask(

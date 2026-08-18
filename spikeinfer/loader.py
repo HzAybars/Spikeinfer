@@ -101,8 +101,14 @@ def load_model(
     dtype: torch.dtype = torch.float32,
     device: str | torch.device = "cuda",
     timesteps: int | None = None,
+    plan=None,
 ) -> tuple[FastSpikingQwenForCausalLM, SpikingQwenConfig]:
-    """Load a spikeinfer model directory onto ``device`` in ``dtype``."""
+    """Load a spikeinfer model directory onto ``device`` in ``dtype``.
+
+    ``plan`` is an optional :class:`spikeinfer.placement.DevicePlan`. Weights
+    are read to host memory either way -- that has always been the first step --
+    so a plan only changes where they go next, and costs nothing when absent.
+    """
     path = Path(path)
     if path.is_file():
         raise ValueError(
@@ -127,7 +133,12 @@ def load_model(
     if unexpected:
         raise RuntimeError(f"checkpoint has {len(unexpected)} unknown tensors, e.g. {unexpected[:5]}")
 
-    model = model.to(device=device)
+    if plan is None:
+        model = model.to(device=device)
+    else:
+        from .placement import apply_plan
+
+        model.model.executor = apply_plan(model, plan, device, dtype)
     if config.tie_word_embeddings:
         model.lm_head.weight = model.model.embed_tokens.weight
     model.eval()

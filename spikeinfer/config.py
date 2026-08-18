@@ -14,6 +14,7 @@ from typing import Literal
 import torch
 
 from .kernels.packing import packed_bytes_per_token
+from .sysinfo import cuda_is_usable
 
 DType = Literal["auto", "float32", "float16", "bfloat16"]
 
@@ -32,7 +33,7 @@ def resolve_dtype(dtype: DType, device: str = "cuda") -> torch.dtype:
     precision buys at these sizes.
     """
     if dtype == "auto":
-        if device.startswith("cuda") and torch.cuda.is_available():
+        if device.startswith("cuda") and cuda_is_usable():
             return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
         return torch.float32
     return _DTYPES[dtype]
@@ -126,11 +127,80 @@ class GraphConfig:
 
 
 @dataclass
+class DeviceConfig:
+    """Where each part of the model lives and computes.
+
+    ``EngineConfig.device`` still names the *compute* device in the ordinary,
+    everything-fits case. This dataclass is what makes the other cases
+    expressible: weights that stay in host RAM and stream to the GPU per layer,
+    and layers that run on the CPU while the rest of the stack runs on the GPU.
+    Its defaults reproduce the previous behaviour exactly -- all weights
+    resident on ``EngineConfig.device``, no streaming, no split.
+
+    See :mod:`spikeinfer.placement`, which turns these knobs into a concrete
+    :class:`~spikeinfer.placement.DevicePlan`.
+    """
+
+    gpu_layers: int | None = None
+    """Layers *computed* on the GPU, counting from 0. ``None`` means all of
+    them; the remainder run on the CPU (this is llama.cpp's ``-ngl``)."""
+
+    offload_layers: int | Literal["auto"] | None = None
+    """Of the GPU-computed layers, how many keep their weights in host RAM and
+    stream them in per step. ``"auto"`` fits as many as VRAM allows."""
+
+    adaptive_mlp: bool = False
+    """Stream only the MLP channels the gate spikes actually activate. Requires
+    ``spike_stats.json`` in the model directory (``spikeinfer spike-stats``)."""
+
+    hot_fraction: float | None = None
+    """Fraction of intermediate channels kept permanently resident under
+    ``adaptive_mlp``. ``None`` derives it from the VRAM budget."""
+
+    offload_embeddings: bool = False
+    """Keep the embedding/lm_head matrix in host RAM. It is one tensor and a
+    large one -- 272 MiB at vocab 151936, hidden 896, bf16."""
+
+    stream_buffers: int = 2
+    """Ring depth for streamed weights. 2 is enough to overlap one layer's copy
+    with the previous layer's compute; 3 helps when copies are jittery."""
+
+    pin_memory: bool = True
+    """Pin the host-side weight buffers. Required for async H2D copies, but
+    pinned pages cannot be swapped -- turn it off if host RAM is tight."""
+
+    cpu_threads: int | None = None
+    """``torch.set_num_threads``. ``None`` leaves torch's own default alone."""
+
+    cpu_kv_gb: float | None = None
+    """Absolute host-RAM budget for KV blocks. Overrides the fraction below."""
+
+    cpu_memory_utilization: float = 0.5
+    """Fraction of *available* host RAM the KV cache may take when
+    ``cpu_kv_gb`` is not set."""
+
+    def __post_init__(self) -> None:
+        if self.stream_buffers < 1:
+            raise ValueError(f"stream_buffers must be >= 1, got {self.stream_buffers}")
+        if self.gpu_layers is not None and self.gpu_layers < 0:
+            raise ValueError(f"gpu_layers must be >= 0, got {self.gpu_layers}")
+        if isinstance(self.offload_layers, int) and self.offload_layers < 0:
+            raise ValueError(f"offload_layers must be >= 0, got {self.offload_layers}")
+        if self.hot_fraction is not None and not 0.0 <= self.hot_fraction <= 1.0:
+            raise ValueError(f"hot_fraction must be in [0, 1], got {self.hot_fraction}")
+        if not 0.0 < self.cpu_memory_utilization <= 1.0:
+            raise ValueError(
+                f"cpu_memory_utilization must be in (0, 1], got {self.cpu_memory_utilization}"
+            )
+
+
+@dataclass
 class EngineConfig:
     model: ModelConfig
     cache: CacheConfig = field(default_factory=CacheConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
+    devices: DeviceConfig = field(default_factory=DeviceConfig)
     device: str = "cuda"
 
     @property
@@ -144,4 +214,4 @@ class EngineConfig:
 def default_device() -> str:
     if os.environ.get("SPIKEINFER_DEVICE"):
         return os.environ["SPIKEINFER_DEVICE"]
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    return "cuda" if cuda_is_usable() else "cpu"

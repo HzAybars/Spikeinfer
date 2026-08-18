@@ -11,6 +11,7 @@ from .spike_attention import (
     paged_spike_attn_decode,
     paged_spike_attn_decode_ref,
 )
+from .spike_attention_cpu import paged_spike_attn_decode_cpu
 
 __all__ = [
     "lif_multistep",
@@ -23,5 +24,6 @@ __all__ = [
     "BITS_PER_WORD",
     "paged_spike_attn_decode",
     "paged_spike_attn_decode_ref",
+    "paged_spike_attn_decode_cpu",
     "gather_kv_unpacked",
 ]

@@ -44,7 +44,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from conftest import build_fast_from_ref, build_ref_model, requires_cuda, small_config
+from conftest import build_fast_from_ref, build_ref_model, small_config
 
 S_VALUES = [1, 4, 7, 12, 15, 23, 32]
 B_VALUES = [1, 2, 3]
@@ -77,7 +77,6 @@ def _cleanup(*modules):
         torch.cuda.empty_cache()
 
 
-@requires_cuda
 @pytest.mark.parametrize("T", T_VALUES)
 @pytest.mark.parametrize("B", B_VALUES)
 @pytest.mark.parametrize("S", S_VALUES)

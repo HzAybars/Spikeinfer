@@ -222,6 +222,10 @@ class FastSpikingQwenModel(nn.Module):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config)
         self._mask_cache = {}
+        self.executor = None
+        """Set by :func:`spikeinfer.placement.apply_plan` when weights do not
+        all live on one device. ``None`` keeps the plain loop below, which is
+        the whole point: placement costs nothing when it is not being used."""
 
     def _causal_mask(self, seq_len, attention_mask, device, dtype):
         key = (seq_len, device, dtype, None if attention_mask is None else id(attention_mask))
@@ -288,12 +292,29 @@ class FastSpikingQwenModel(nn.Module):
         T = T or self.config.T
         n_tok = input_ids.shape[0]
 
-        embeds = self.embed_tokens(input_ids.unsqueeze(0))  # [1, n_tok, D]
-        cos, sin = self.rotary_emb(embeds, positions.unsqueeze(0))
+        # The embedding may live on a different device from the first layer
+        # (--offload-embeddings, or a CPU-only layer split). The lookup result
+        # is [1, n_tok, D] -- small enough that crossing once costs nothing.
+        embed_device = self.embed_tokens.weight.device
+        entry = self.executor.entry_device() if self.executor is not None else embed_device
+        embeds = self.embed_tokens(input_ids.to(embed_device).unsqueeze(0))
+        if embeds.device != entry:
+            embeds = embeds.to(entry)
+
+        rope_device = self.rotary_emb.inv_freq.device
+        cos, sin = self.rotary_emb(
+            embeds.to(rope_device) if embeds.device != rope_device else embeds,
+            positions.to(rope_device).unsqueeze(0),
+        )
+        if cos.device != entry:
+            cos, sin = cos.to(entry), sin.to(entry)
         h = embeds.unsqueeze(0).expand(T, 1, n_tok, -1).contiguous()
 
-        for i, layer in enumerate(self.layers):
-            h = layer.forward_paged(h, cos, sin, kv_caches[i][0], kv_caches[i][1], meta)
+        if self.executor is not None:
+            h = self.executor.run(self, h, cos, sin, kv_caches, meta)
+        else:
+            for i, layer in enumerate(self.layers):
+                h = layer.forward_paged(h, cos, sin, kv_caches[i][0], kv_caches[i][1], meta)
 
         return self.norm(h).mean(dim=0).squeeze(0)
 
@@ -319,7 +340,15 @@ class FastSpikingQwenForCausalLM(nn.Module):
         the row selection happens *before* ``lm_head``, not after.
         """
         if indices is not None:
-            hidden = hidden.index_select(0, indices)
+            # Under a hybrid split the hidden state comes back from whichever
+            # device ran the last layer, while the runner built the indices on
+            # the engine's device.
+            hidden = hidden.index_select(0, indices.to(hidden.device))
+        # Row selection happens first, so what crosses to an offloaded lm_head
+        # is [n_sampled, D] -- a few kilobytes, not the whole prefill.
+        head_device = self.lm_head.weight.device
+        if hidden.device != head_device:
+            hidden = hidden.to(head_device)
         return self.lm_head(hidden)
 
     def forward(self, input_ids, attention_mask=None, labels=None, T=None, use_sdpa=False):

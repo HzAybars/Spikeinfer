@@ -3,6 +3,7 @@
 [![CI](https://github.com/HzAybars/Spikeinfer/actions/workflows/ci.yml/badge.svg)](https://github.com/HzAybars/Spikeinfer/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](pyproject.toml)
+[![Version 0.3.0](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
 
 An inference engine and OpenAI-compatible server for **spiking (LIF) transformers** —
 what vLLM is for dense models, for models whose activations are spikes.
@@ -22,6 +23,11 @@ Continuous batching, a paged KV cache, CUDA graphs, streaming, per-request sampl
 the usual serving stack. What is not usual is what it stores and how it computes
 attention, because in a spiking model the tensors are **binary**.
 
+**New in 0.3:** the model no longer has to fit in VRAM, or have a GPU to run on.
+Weight offload keeps decode bit-identical and inside a captured CUDA graph — 989 MiB
+of resident weights down to 389 MiB. There is also a CPU/GPU layer split, a pure-CPU
+mode, and five new commands. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Contents
 
 - [The idea: spikes are bits, so store bits](#the-idea-spikes-are-bits-so-store-bits)
@@ -29,9 +35,12 @@ attention, because in a spiking model the tensors are **binary**.
 - [Install](#install)
 - [Getting a model](#getting-a-model)
 - [Use](#use)
+- [Running a model that does not fit](#running-a-model-that-does-not-fit)
+- [New commands](#new-commands)
 - [Correctness](#correctness)
 - [What it does not do](#what-it-does-not-do)
 - [Layout](#layout)
+- [Changelog](CHANGELOG.md)
 - [License](#license)
 
 ## The idea: spikes are bits, so store bits
@@ -100,9 +109,18 @@ spikeinfer bench ./qwen-spiking --concurrency 32 --input-len 128 --output-len 64
 
 Spiking LLMs are usually *slower* than the dense models they replace, and the intuitive
 diagnosis — "binary spikes are being simulated as dense FP32 matmuls" — is wrong for this
-architecture. LIF neurons sit on the **output** of `q/k/v/gate_proj`, so **no `nn.Linear`
-ever consumes a spike tensor**. A sparse spike-driven GEMV kernel has nothing to attach
-to, and INT8 tensor cores measured *slower* than fp16 at these shapes (0.28x).
+architecture. LIF neurons sit on the **output** of `q/k/v/gate_proj`, so for attention
+**no `nn.Linear` ever consumes a spike tensor** — `o_proj` sees a softmax-weighted
+context, which is dense. A sparse spike-driven GEMV kernel has nothing to attach to
+there, and INT8 tensor cores measured *slower* than fp16 at these shapes (0.28x).
+
+The MLP is the exception, and it is 87.6% of a decoder layer's parameters:
+`down_proj(gate_spk * up_proj(x))` is exactly zero wherever the gate is silent, so
+`up_proj`'s rows and `down_proj`'s columns *are* skippable. Measured gate firing on the
+calibrated checkpoint is 5.5% (union over T, batch 1). Exploiting it is implemented
+(`--adaptive-mlp`) and does cut per-step transfer 180x — and still loses to plain
+weight streaming on this hardware, because it costs CUDA graph capture. The write-up
+is in [docs/placement.md](docs/placement.md); it is a win on CPU (+30%).
 
 The real bottleneck was **kernel launch count**. One T=4 decode step issued **27,859 CUDA
 launches**, and Windows WDDM costs roughly 10 us per launch. The tell: decoding a single
@@ -215,9 +233,56 @@ spikes = lif_multistep(current, beta, threshold)   # current: [T, *dims, N]
 packed = pack_spikes(spikes)                       # 1 bit per spike
 ```
 
+## Running a model that does not fit
+
+The engine no longer assumes the model fits in VRAM, or that there is a GPU at all.
+
+```bash
+spikeinfer serve ./qwen-spiking --offload-layers auto   # weights stream from host RAM
+spikeinfer serve ./qwen-spiking --gpu-layers 12         # first 12 layers on GPU, rest on CPU
+spikeinfer serve ./qwen-spiking --device cpu            # no GPU at all
+```
+
+Qwen2.5-0.5B, T=4, bf16, RTX 4070 SUPER, batch 1, KV cache held constant:
+
+| | resident VRAM | tok/s |
+|---|---|---|
+| everything resident | 989 MiB | 170.4 |
+| `--offload-layers 12` | 872 MiB | 56.2 |
+| `--offload-layers 24` | **389 MiB** | 34.9 |
+| `--offload-layers 24 --offload-embeddings` | **325 MiB** | 27.1 |
+| `--gpu-layers 12` | — | 15.2 |
+| `--device cpu` | — | 9.5 |
+
+Streaming is **bit-identical** to running resident: same device, same arithmetic, only
+the weights' address changed. It also stays inside a captured CUDA graph — a copy from
+pinned memory is a legal graph node — which is why it beats every other way of not
+fitting. Splitting layers across devices cannot be bit-identical (CPU and GPU reduce in
+different orders, and this model turns a 1-ulp difference into a flipped spike), so
+there the claim is token agreement.
+
+Work out what fits before loading anything:
+
+```bash
+spikeinfer plan ./qwen-spiking --vram-gb 2 --offload-layers auto
+```
+
+Details, including the sparse-MLP experiment and why it does not pay on this hardware:
+[docs/placement.md](docs/placement.md).
+
+## New commands
+
+| | |
+|---|---|
+| `spikeinfer doctor` | can this machine run it, and how fast — torch/CUDA/Triton, `cl.exe`, `CUDA_HOME` vs the torch build, PCIe bandwidth, and a live kernel compile |
+| `spikeinfer plan <model>` | what would fit and what it would cost, from the config alone |
+| `spikeinfer validate <model>` | the correctness gates against a real checkpoint and placement |
+| `spikeinfer profile <model>` | where a decode step's time goes, and what it is bound by |
+| `spikeinfer spike-stats <model>` | how often the MLP gate fires — decides whether `--adaptive-mlp` pays |
+
 ## Correctness
 
-**330 tests.** The one that matters most is
+**390 tests.** The one that matters most is
 `tests/test_engine.py::test_greedy_matches_the_eager_path`: greedy generation through the
 entire serving stack — paged cache, bit-packed spikes, popcount attention, continuous
 batching, CUDA graph replay — must produce the **same token ids** as the simple eager
@@ -240,8 +305,14 @@ Also asserted:
   output;
 - results do not depend on batch composition: run alone or 32-at-a-time, same tokens.
 
-128 of the tests run without a GPU, and CI runs those. The rest need CUDA and skip
-themselves — which means **CI passing does not mean the kernels are correct**; run the
+**301 of the tests run without a GPU**, up from 128: the engine tests — scheduling,
+paging, chunked prefill, preemption, sampling — used to skip themselves without CUDA
+even though none of that is device-specific, so CI was not checking the engine at all.
+Now it is. `SPIKEINFER_TEST_DEVICE=cpu` reproduces the CI configuration on a GPU
+machine.
+
+What still needs a GPU is the kernels and CUDA graph capture, and those skip
+themselves — so **CI passing still does not mean the kernels are correct**; run the
 full suite on a GPU before trusting a change.
 
 ### The one thing to know if you touch the LIF kernel
@@ -260,7 +331,9 @@ these wrong degrades the model silently rather than failing.
   the reference implementation faithfully; a poorly calibrated checkpoint produces poor
   output, faithfully. The 0.5B checkpoint this was developed against sits at WikiText-2
   perplexity ~390.
-- **One GPU.** No tensor or pipeline parallelism, no CPU offload.
+- **One GPU.** No tensor or pipeline parallelism. Weight offload, a CPU/GPU layer
+  split and a pure-CPU mode do exist — see [docs/placement.md](docs/placement.md) —
+  but there is still no multi-GPU anything.
 - **Qwen2 architecture** (GQA supported). The kernels are architecture-agnostic; the model
   class is not.
 - **No prefix caching, no beam search.** Preemption recomputes rather than swapping to
@@ -281,6 +354,7 @@ spikeinfer/
     lif_triton.py         fused multi-timestep LIF, one launch for all T
     spike_attention.py    paged popcount attention over packed spikes
     packing.py            bit-packing (Triton fast path + torch fallback)
+    spike_attention_cpu.py  batched paged attention for the CPU backend
   engine/
     llm_engine.py         requests in, tokens out
     scheduler.py          continuous batching, chunked prefill, preemption
@@ -290,15 +364,23 @@ spikeinfer/
     sampler.py            batched per-request sampling
     async_engine.py       asyncio wrapper for the server
   entrypoints/
-    cli.py                serve / chat / generate / convert / bench / info
+    cli.py                serve / chat / generate / convert / bench / info /
+                          doctor / plan / validate / profile / spike-stats
     openai/               OpenAI-compatible HTTP API
   attention.py            paged attention wiring
   modeling_fast.py        layer-major, T-batched model
+  placement.py            per-layer placement: plan, executor, channel permutation
+  offload.py              flat weight buffers, the streaming ring, the sparse MLP
+  spike_stats.py          gate firing rates: what --adaptive-mlp rests on
+  diagnostics.py          spikeinfer doctor
+  validation.py           spikeinfer validate
+  profiling.py            spikeinfer profile
+  sysinfo.py              host RAM and honest CUDA availability
   loader.py, convert.py   model directory format
   reference/              unoptimized snntorch implementation (golden reference)
-tests/                    330 tests
+tests/                    390 tests
 bench/                    kernel-level timing and CUDA launch counting
-docs/                     architecture and conversion notes
+docs/                     architecture, conversion and placement notes
 examples/                 runnable scripts
 ```
 

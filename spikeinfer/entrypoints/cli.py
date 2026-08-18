@@ -6,17 +6,24 @@
     spikeinfer generate ./qwen-spiking -p "The capital of France is"
     spikeinfer bench    ./qwen-spiking --concurrency 16
     spikeinfer info     ./qwen-spiking
+    spikeinfer spike-stats ./qwen-spiking
+    spikeinfer doctor
+    spikeinfer plan     ./qwen-spiking --offload-layers auto
+    spikeinfer validate ./qwen-spiking
+    spikeinfer profile  ./qwen-spiking --batch 1 --batch 8
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 
 from ..config import (
     CacheConfig,
+    DeviceConfig,
     EngineConfig,
     GraphConfig,
     ModelConfig,
@@ -42,8 +49,53 @@ def _add_engine_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--num-gpu-blocks-override", type=int, default=None)
     group.add_argument("--no-chunked-prefill", action="store_true")
     group.add_argument("--no-cuda-graph", action="store_true")
-    group.add_argument("--device", default=None)
+    group.add_argument("--device", default=None, help="cuda, cuda:N or cpu")
     group.add_argument("--seed", type=int, default=0)
+
+    placement = parser.add_argument_group(
+        "placement",
+        "Where weights live and where layers compute. The defaults keep every "
+        "weight resident on --device, which is what fits on one GPU.",
+    )
+    placement.add_argument(
+        "--gpu-layers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="run the first N layers on the GPU and the rest on the CPU "
+        "(default: all on the GPU)",
+    )
+    placement.add_argument(
+        "--offload-layers",
+        default=None,
+        metavar="N|auto",
+        help="keep this many layers' weights in host RAM and stream them per step",
+    )
+    placement.add_argument(
+        "--offload-embeddings",
+        action="store_true",
+        help="keep the embedding/lm_head matrix in host RAM",
+    )
+    placement.add_argument(
+        "--adaptive-mlp",
+        action="store_true",
+        help="stream only the MLP channels the gate spikes activate "
+        "(needs spike_stats.json; see `spikeinfer spike-stats`)",
+    )
+    placement.add_argument("--hot-fraction", type=float, default=None, metavar="F")
+    placement.add_argument("--stream-buffers", type=int, default=2, metavar="K")
+    placement.add_argument("--no-pin-memory", action="store_true")
+    placement.add_argument(
+        "--cpu-threads", type=int, default=None, metavar="N", help="torch.set_num_threads"
+    )
+    placement.add_argument(
+        "--cpu-kv-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help="host RAM budget for the KV cache (default: a fraction of what is free)",
+    )
+    placement.add_argument("--cpu-memory-utilization", type=float, default=0.5, metavar="F")
 
 
 def _engine_config(args: argparse.Namespace) -> EngineConfig:
@@ -69,8 +121,30 @@ def _engine_config(args: argparse.Namespace) -> EngineConfig:
             enable_chunked_prefill=not args.no_chunked_prefill,
         ),
         graph=GraphConfig(enabled=not args.no_cuda_graph, max_seq_len=max_len),
+        devices=DeviceConfig(
+            gpu_layers=args.gpu_layers,
+            offload_layers=_offload_layers(args.offload_layers),
+            adaptive_mlp=args.adaptive_mlp,
+            hot_fraction=args.hot_fraction,
+            offload_embeddings=args.offload_embeddings,
+            stream_buffers=args.stream_buffers,
+            pin_memory=not args.no_pin_memory,
+            cpu_threads=args.cpu_threads,
+            cpu_kv_gb=args.cpu_kv_gb,
+            cpu_memory_utilization=args.cpu_memory_utilization,
+        ),
         device=args.device or default_device(),
     )
+
+
+def _offload_layers(value: str | None) -> int | str | None:
+    """``--offload-layers`` takes a count or the word ``auto``."""
+    if value is None or value == "auto":
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        raise SystemExit(f"--offload-layers wants a number or 'auto', got {value!r}") from None
 
 
 def _sampling_args(parser: argparse.ArgumentParser) -> None:
@@ -259,6 +333,181 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profile(args: argparse.Namespace) -> int:
+    from ..profiling import profile_engine
+
+    report = profile_engine(
+        _engine_config(args),
+        prompt_len=args.prompt_len,
+        batches=tuple(args.batch) if args.batch else (1, 8),
+        iterations=args.iterations,
+    )
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    from ..validation import run
+
+    config = _engine_config(args)
+    result = run(
+        config,
+        max_tokens=args.max_tokens,
+        skip_reference=args.skip_reference,
+    )
+    print(json.dumps(result.to_dict(), indent=2) if args.json else result.render())
+    return 1 if result.failed else 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    import torch
+
+    from ..config import DeviceConfig, resolve_dtype
+    from ..engine.spike_cache import PagedSpikeCache
+    from ..loader import load_config
+    from ..placement import plan_from_config
+    from ..sysinfo import cuda_is_usable
+
+    config = load_config(args.model)
+    if args.timesteps:
+        config.T = args.timesteps
+    device = "cuda" if (args.device or "").startswith("cuda") or (
+        args.device is None and cuda_is_usable()
+    ) else "cpu"
+    dtype = resolve_dtype(args.dtype, device)
+
+    if args.vram_gb is not None:
+        free_vram = int(args.vram_gb * 2**30)
+    elif cuda_is_usable():
+        free_vram = torch.cuda.mem_get_info()[0]
+    else:
+        free_vram = 0
+
+    stats = None
+    stats_path = args.spike_stats or (Path(args.model) / "spike_stats.json")
+    if Path(stats_path).exists():
+        from .. import spike_stats as spike_stats_mod
+
+        stats = spike_stats_mod.load(stats_path)
+
+    devices = DeviceConfig(
+        gpu_layers=args.gpu_layers,
+        offload_layers=_offload_layers(args.offload_layers),
+        adaptive_mlp=args.adaptive_mlp,
+        hot_fraction=args.hot_fraction,
+        offload_embeddings=args.offload_embeddings,
+    )
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    per_block = PagedSpikeCache.bytes_per_block(
+        config.num_hidden_layers, config.T, config.num_key_value_heads, head_dim, args.block_size
+    )
+    ceiling = math.ceil(args.max_num_seqs * args.max_model_len / args.block_size) + 1
+
+    plan = plan_from_config(config, devices, dtype, free_vram)
+    # Size the cache against what the weights leave behind, then re-plan so the
+    # two agree -- the placement decides the leftover and the leftover decides
+    # the cache, so one pass each way is the cheapest fixed point that is honest.
+    from ..placement import Placement, weight_sizes
+
+    sizes = weight_sizes(config)
+    resident = plan.count(Placement.GPU) * sizes.layer_bytes(dtype)
+    if plan.embeddings is Placement.GPU:
+        resident += sizes.embedding_bytes(dtype)
+    kv_budget = max(0, free_vram - resident) * args.gpu_memory_utilization
+    num_blocks = max(2, min(int(kv_budget // per_block), ceiling)) if free_vram else ceiling
+
+    from ..diagnostics import measured_h2d_bandwidth
+    from ..diagnostics import run as run_diagnostics
+    from ..placement import describe_plan
+
+    h2d = args.h2d_gb_s
+    if h2d is None and args.measure_pcie:
+        h2d = measured_h2d_bandwidth(run_diagnostics())
+
+    union = stats["summary"]["mean_union_rate"] if stats else None
+    report = describe_plan(
+        config, plan, dtype, args.block_size, num_blocks, union_rate=union, h2d_gb_s=h2d
+    )
+    report["model"] = str(args.model)
+    report["free_vram"] = None if not free_vram else _format_bytes(free_vram)
+    report["spike_stats"] = str(stats_path) if stats else None
+
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def _format_bytes(n):
+    from ..sysinfo import format_bytes
+
+    return format_bytes(n)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from ..diagnostics import run
+
+    report = run()
+    print(json.dumps(report.to_dict(), indent=2) if args.json else report.render())
+    return 1 if report.failed else 0
+
+
+def cmd_spike_stats(args: argparse.Namespace) -> int:
+    import torch
+
+    from .. import spike_stats
+    from ..config import default_device, resolve_dtype
+    from ..loader import load_model
+
+    device = torch.device(args.device or default_device())
+    dtype = resolve_dtype(args.dtype, str(device))
+    model, config = load_model(args.model, dtype=dtype, device=device, timesteps=args.timesteps)
+
+    texts = spike_stats.SAMPLE_TEXT
+    if args.prompt_file:
+        texts = [
+            line
+            for line in Path(args.prompt_file).read_text("utf-8").splitlines()
+            if line.strip()
+        ]
+
+    tokenizer = _tokenizer_for(args.tokenizer or args.model)
+    if tokenizer is None:
+        print(
+            f"no tokenizer in {args.tokenizer or args.model}; firing rates are "
+            "input-dependent and random ids would not represent real traffic",
+            file=sys.stderr,
+        )
+        return 2
+    batches = spike_stats.build_batches(tokenizer, texts, args.max_len)
+    if not batches:
+        print("no usable text to measure", file=sys.stderr)
+        return 2
+
+    stats = spike_stats.collect(model, config, batches, device)
+    stats["model"] = str(args.model)
+    print(spike_stats.format_summary(stats))
+
+    out = args.out
+    if out is None and args.write:
+        out = str(Path(args.model) / "spike_stats.json")
+    if out:
+        spike_stats.write(stats, out)
+        print()
+        print(f"wrote {out}")
+    return 0
+
+
+def _tokenizer_for(source: str):
+    try:
+        from transformers import AutoTokenizer
+
+        from ..hf_compat import register_auto_classes
+
+        register_auto_classes()
+        return AutoTokenizer.from_pretrained(source)
+    except Exception:
+        return None
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     from ..bench import run_benchmark
 
@@ -340,6 +589,89 @@ def build_parser() -> argparse.ArgumentParser:
     info.add_argument("model")
     info.add_argument("--block-size", type=int, default=32)
     info.set_defaults(func=cmd_info)
+
+    profile = sub.add_parser(
+        "profile",
+        help="where a decode step's time goes: launches, transfers, and what "
+        "the step is bound by",
+        description="Profiles the serving engine. For model-level kernel launch "
+        "counts across the reference model, the fast model and a captured graph, "
+        "use bench/profile_kernels.py instead.",
+    )
+    _add_engine_args(profile)
+    profile.add_argument("--prompt-len", type=int, default=32)
+    profile.add_argument(
+        "--batch", type=int, action="append", default=None, help="decode batch size, repeatable"
+    )
+    profile.add_argument("--iterations", type=int, default=30)
+    profile.set_defaults(func=cmd_profile)
+
+    validate = sub.add_parser(
+        "validate",
+        help="run the correctness gates against a real checkpoint and placement",
+    )
+    _add_engine_args(validate)
+    validate.add_argument("--max-tokens", "-n", type=int, default=16)
+    validate.add_argument(
+        "--skip-reference",
+        action="store_true",
+        help="skip the snntorch comparison (it builds a second full model)",
+    )
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=cmd_validate)
+
+    plan_cmd = sub.add_parser(
+        "plan",
+        help="what would fit on this machine, and what it would cost -- reads "
+        "the config only, never the weights",
+    )
+    plan_cmd.add_argument("model")
+    plan_cmd.add_argument(
+        "--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"]
+    )
+    plan_cmd.add_argument("--timesteps", "-T", type=int, default=None)
+    plan_cmd.add_argument("--device", default=None)
+    plan_cmd.add_argument("--vram-gb", type=float, default=None, help="default: what is free now")
+    plan_cmd.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    plan_cmd.add_argument("--block-size", type=int, default=32)
+    plan_cmd.add_argument("--max-model-len", type=int, default=4096)
+    plan_cmd.add_argument("--max-num-seqs", type=int, default=64)
+    plan_cmd.add_argument("--gpu-layers", type=int, default=None)
+    plan_cmd.add_argument("--offload-layers", default=None, metavar="N|auto")
+    plan_cmd.add_argument("--offload-embeddings", action="store_true")
+    plan_cmd.add_argument("--adaptive-mlp", action="store_true")
+    plan_cmd.add_argument("--hot-fraction", type=float, default=None)
+    plan_cmd.add_argument("--spike-stats", default=None, help="default: <model>/spike_stats.json")
+    plan_cmd.add_argument("--h2d-gb-s", type=float, default=None)
+    plan_cmd.add_argument(
+        "--measure-pcie", action="store_true", help="time a real host-to-device copy"
+    )
+    plan_cmd.set_defaults(func=cmd_plan)
+
+    doctor = sub.add_parser(
+        "doctor", help="check this machine can run spikeinfer, and how fast"
+    )
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+
+    spike_stats_cmd = sub.add_parser(
+        "spike-stats",
+        help="measure how often the MLP gate fires (decides if --adaptive-mlp pays)",
+    )
+    spike_stats_cmd.add_argument("model")
+    spike_stats_cmd.add_argument("--tokenizer", default=None)
+    spike_stats_cmd.add_argument(
+        "--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"]
+    )
+    spike_stats_cmd.add_argument("--timesteps", "-T", type=int, default=None)
+    spike_stats_cmd.add_argument("--device", default=None)
+    spike_stats_cmd.add_argument("--prompt-file", default=None, help="one text per line")
+    spike_stats_cmd.add_argument("--max-len", type=int, default=256)
+    spike_stats_cmd.add_argument("--out", default=None, help="write the JSON here")
+    spike_stats_cmd.add_argument(
+        "--write", action="store_true", help="write spike_stats.json into the model directory"
+    )
+    spike_stats_cmd.set_defaults(func=cmd_spike_stats)
 
     bench = sub.add_parser("bench", help="measure throughput and latency")
     _add_engine_args(bench)

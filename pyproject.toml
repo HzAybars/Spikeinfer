@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spikeinfer"
-version = "0.2.0"
-description = "Inference engine and OpenAI-compatible server for spiking (LIF) transformers: bit-packed spike KV cache, popcount attention, continuous batching, CUDA graphs"
+version = "0.3.0"
+description = "Inference engine and OpenAI-compatible server for spiking (LIF) transformers: bit-packed spike KV cache, popcount attention, continuous batching, CUDA graphs, weight offload and CPU/hybrid execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-keywords = ["spiking-neural-networks", "snn", "llm", "inference", "triton", "lif", "qwen"]
+keywords = ["spiking-neural-networks", "snn", "llm", "inference", "triton", "lif", "qwen", "offload", "cpu-inference"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",

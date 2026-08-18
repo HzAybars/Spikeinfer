@@ -14,6 +14,7 @@ Two responsibilities:
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -169,6 +170,12 @@ class ModelRunner:
             indices = None
             hidden = hidden[: len(model_input.sample_seqs)]
         logits = self.model.compute_logits(hidden, indices)
+        # The sampler runs on the engine's device. Under a hybrid split or an
+        # offloaded lm_head the logits may arrive from elsewhere; this is
+        # [n_sampled, vocab], a couple of MiB at most, and it happens once per
+        # step rather than once per layer.
+        if logits.device != self.device:
+            logits = logits.to(self.device)
         return logits.float(), model_input.sample_seqs
 
     def _graph_for(self, batch_size: int) -> CUDAGraphRunner | None:
@@ -186,7 +193,23 @@ class ModelRunner:
         captured = []
         for size in self.config.graph.buckets_upto(self.config.scheduler.max_num_seqs):
             runner = CUDAGraphRunner(self, size)
-            runner.capture()
+            try:
+                runner.capture()
+            except RuntimeError as exc:
+                # Capture is an optimisation, never a correctness requirement.
+                # A driver that refuses (most likely over a stream-capture rule
+                # the streamed-weight path trips) must degrade to eager rather
+                # than take the server down -- but silently losing a 3.6x
+                # speedup would be worse, so say so.
+                self.graph_runners.clear()
+                warnings.warn(
+                    f"CUDA graph capture failed at batch size {size} "
+                    f"({type(exc).__name__}: {exc}); falling back to eager decode. "
+                    "Throughput will drop substantially on Windows/WDDM.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return []
             self.graph_runners[size] = runner
             captured.append(size)
         return captured

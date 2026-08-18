@@ -10,6 +10,12 @@ happens, never *what* comes out.
 The rest are the properties a server is expected to hold under load: results
 must not depend on batch composition, on whether a prompt was chunked, or on
 whether a sequence was preempted and recomputed halfway through.
+
+All of this runs on CPU as well as GPU. Only ``test_cuda_graph_decode_matches_
+eager_decode`` needs a device, because capture is the one thing here that is not
+device-independent -- everything else (scheduling, paging, chunked prefill,
+preemption, sampling) is engine logic that CI should be checking, and was not
+being checked until this module stopped skipping itself without CUDA.
 """
 from __future__ import annotations
 
@@ -17,7 +23,6 @@ import pytest
 import torch
 
 from conftest import (
-    CUDA_AVAILABLE,
     requires_cuda,
     run_to_completion,
     small_config,
@@ -32,8 +37,6 @@ from spikeinfer.config import (
 from spikeinfer.engine.llm_engine import LLMEngine
 from spikeinfer.kv_cache import generate as eager_generate
 from spikeinfer.sampling_params import SamplingParams
-
-pytestmark = pytest.mark.skipif(not CUDA_AVAILABLE, reason="engine tests need CUDA")
 
 GREEDY = dict(temperature=0.0, ignore_eos=True)
 PROMPTS = [[5, 91, 44, 7, 200, 13], [1, 2, 3], [77] * 20]
@@ -68,7 +71,6 @@ def generate_ids(engine, prompt, max_tokens=12, **params):
 # -- equivalence ----------------------------------------------------------
 
 
-@requires_cuda
 @pytest.mark.parametrize("prompt", PROMPTS)
 def test_greedy_matches_the_eager_path(tiny_engine, prompt):
     """The whole point: paging and batching must not change the output."""
@@ -97,7 +99,6 @@ def test_cuda_graph_decode_matches_eager_decode(tiny_model_dir, device):
     torch.cuda.empty_cache()
 
 
-@requires_cuda
 def test_batching_does_not_change_results(tiny_engine):
     """Run alone, then all together: identical tokens either way."""
     alone = [generate_ids(tiny_engine, p, max_tokens=10) for p in PROMPTS]
@@ -113,7 +114,6 @@ def test_batching_does_not_change_results(tiny_engine):
     assert together == alone
 
 
-@requires_cuda
 def test_chunked_prefill_matches_whole_prefill(tiny_model_dir, device):
     """A prompt split across steps must land in the same cache state."""
     prompt = list(range(1, 61))
@@ -130,7 +130,6 @@ def test_chunked_prefill_matches_whole_prefill(tiny_model_dir, device):
     torch.cuda.empty_cache()
 
 
-@requires_cuda
 def test_preemption_and_recompute_preserve_output(tiny_model_dir, device):
     """Squeeze the cache until a running sequence is evicted mid-generation.
 
@@ -167,14 +166,12 @@ def test_preemption_and_recompute_preserve_output(tiny_model_dir, device):
 # -- request semantics ----------------------------------------------------
 
 
-@requires_cuda
 def test_max_tokens_is_respected(tiny_engine):
     for limit in (1, 5, 17):
         tokens = generate_ids(tiny_engine, PROMPTS[0], max_tokens=limit)
         assert len(tokens) == limit
 
 
-@requires_cuda
 def test_finish_reason_length(tiny_engine):
     request_id = tiny_engine.add_request(
         prompt_token_ids=PROMPTS[0], sampling_params=SamplingParams(max_tokens=4, **GREEDY)
@@ -183,7 +180,6 @@ def test_finish_reason_length(tiny_engine):
     assert output.outputs[0].finish_reason == "length"
 
 
-@requires_cuda
 def test_stop_token_id_ends_the_sequence(tiny_engine):
     """Stop on whatever the model would produce second, and check it stops."""
     baseline = generate_ids(tiny_engine, PROMPTS[0], max_tokens=6)
@@ -202,7 +198,6 @@ def test_stop_token_id_ends_the_sequence(tiny_engine):
     assert len(output.outputs[0].token_ids) <= 3
 
 
-@requires_cuda
 def test_n_greater_than_one_returns_n_completions(tiny_engine):
     request_id = tiny_engine.add_request(
         prompt_token_ids=PROMPTS[1],
@@ -214,7 +209,6 @@ def test_n_greater_than_one_returns_n_completions(tiny_engine):
     assert all(len(o.token_ids) == 5 for o in output.outputs)
 
 
-@requires_cuda
 def test_abort_stops_a_running_request(tiny_engine):
     request_id = tiny_engine.add_request(
         prompt_token_ids=PROMPTS[2], sampling_params=SamplingParams(max_tokens=64, **GREEDY)
@@ -227,7 +221,6 @@ def test_abort_stops_a_running_request(tiny_engine):
     assert free_before == tiny_engine.block_manager.num_blocks, "aborting leaked blocks"
 
 
-@requires_cuda
 def test_a_request_that_can_never_fit_is_dropped_not_looped(tiny_model_dir, device):
     """A cache too small for one sequence must error out, not livelock."""
     engine = build_engine(
@@ -248,13 +241,11 @@ def test_a_request_that_can_never_fit_is_dropped_not_looped(tiny_model_dir, devi
     torch.cuda.empty_cache()
 
 
-@requires_cuda
 def test_prompt_longer_than_the_model_is_rejected(tiny_engine):
     with pytest.raises(ValueError, match="model limit"):
         tiny_engine.add_request(prompt_token_ids=list(range(1, 500)))
 
 
-@requires_cuda
 def test_empty_prompt_is_rejected(tiny_engine):
     with pytest.raises(ValueError, match="empty prompt"):
         tiny_engine.add_request(prompt_token_ids=[])
@@ -263,7 +254,6 @@ def test_empty_prompt_is_rejected(tiny_engine):
 # -- resource accounting --------------------------------------------------
 
 
-@requires_cuda
 def test_blocks_are_returned_after_every_request(tiny_engine):
     total = tiny_engine.block_manager.num_blocks
     for prompt in PROMPTS:
@@ -271,7 +261,6 @@ def test_blocks_are_returned_after_every_request(tiny_engine):
     assert tiny_engine.block_manager.num_free_blocks == total, "blocks leaked across requests"
 
 
-@requires_cuda
 def test_stats_track_generation(tiny_engine):
     before = tiny_engine.stats.generation_tokens
     generate_ids(tiny_engine, PROMPTS[0], max_tokens=7)
@@ -279,7 +268,6 @@ def test_stats_track_generation(tiny_engine):
     assert tiny_engine.stats.steps > 0
 
 
-@requires_cuda
 def test_describe_reports_the_cache_layout(tiny_engine):
     info = tiny_engine.describe()
     assert info["timesteps"] == small_config().T
@@ -288,7 +276,6 @@ def test_describe_reports_the_cache_layout(tiny_engine):
     assert info["dtype"] == "float32"
 
 
-@requires_cuda
 def test_cache_capacity_reflects_bit_packing(tiny_engine):
     """A packed block must cost 1/32 of an fp32 one, not more."""
     cache = tiny_engine.cache

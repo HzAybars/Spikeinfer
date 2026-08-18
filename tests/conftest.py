@@ -5,14 +5,22 @@ checkpoint. See `small_config()`.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
 from spikeinfer.modeling_fast import FastSpikingQwenForCausalLM
 from spikeinfer.reference import SpikingQwenConfig, SpikingQwenForCausalLM
 from spikeinfer.reference.lif import LIFNeuron
+from spikeinfer.sysinfo import cuda_is_usable
 
-CUDA_AVAILABLE = torch.cuda.is_available()
+# `torch.cuda.is_available()` alone is not enough -- see sysinfo.cuda_is_usable.
+# SPIKEINFER_TEST_DEVICE=cpu forces the CPU suite on a machine that has a GPU,
+# which is how the CI configuration is reproduced locally.
+CUDA_AVAILABLE = (
+    cuda_is_usable() and os.environ.get("SPIKEINFER_TEST_DEVICE", "").lower() != "cpu"
+)
 
 requires_cuda = pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA GPU required")
 
@@ -124,9 +132,14 @@ def tiny_engine(tiny_model_dir, device):
 
     Session-scoped because engine construction captures graphs; tests must
     therefore leave it with no pending requests (they all run to completion).
+
+    Runs on CPU when there is no GPU. That is the point: everything the engine
+    does above the kernels -- scheduling, paging, chunked prefill, preemption,
+    sampling, detokenization -- is device-independent, and until this fixture
+    worked without CUDA none of it was covered by CI. Graph capture is the one
+    part that genuinely needs a GPU, and it is disabled here rather than
+    skipping the whole fixture.
     """
-    if not CUDA_AVAILABLE:
-        pytest.skip("engine tests need CUDA")
     from spikeinfer.config import (
         CacheConfig,
         EngineConfig,
@@ -142,13 +155,16 @@ def tiny_engine(tiny_model_dir, device):
         scheduler=SchedulerConfig(
             max_num_seqs=8, max_num_batched_tokens=256, max_model_len=128
         ),
-        graph=GraphConfig(enabled=True, batch_sizes=(1, 2, 4, 8), max_seq_len=128),
+        graph=GraphConfig(
+            enabled=CUDA_AVAILABLE, batch_sizes=(1, 2, 4, 8), max_seq_len=128
+        ),
         device=device,
     )
     engine = LLMEngine(config)
     yield engine
     del engine
-    torch.cuda.empty_cache()
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
 
 
 def run_to_completion(engine, request_ids=None):
